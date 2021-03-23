@@ -1,0 +1,10 @@
+setuptools
+wheel
+numpy
+scipy
+pyserial
+matplotlib
+pyqtgraph
+PyQt5
+h5py
+Flask

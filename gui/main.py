@@ -1,0 +1,2217 @@
+import os
+import re
+import sys
+import ntpath
+import numpy as np
+import serial.tools.list_ports
+import h5py
+import logging
+import signal
+import threading
+import copy
+import json
+
+from PyQt5.QtWidgets import (QComboBox, QMainWindow, QApplication, QWidget, QLabel, QLineEdit,
+                             QCheckBox, QFrame, QPushButton)
+from PyQt5.QtGui import QIcon
+from PyQt5.QtCore import pyqtSignal
+from PyQt5 import QtCore, QtWidgets
+
+import pyqtgraph as pg
+
+import acconeer_utils
+from acconeer_utils.clients import SocketClient, SPIClient, UARTClient
+from acconeer_utils.clients.mock.client import MockClient
+from acconeer_utils.clients import configs
+from acconeer_utils import example_utils
+from acconeer_utils.structs import configbase
+
+sys.path.append(os.path.dirname(__file__))  # noqa: E402
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))  # noqa: E402
+
+import data_processing
+from modules import MODULE_INFOS, MODULE_LABEL_TO_MODULE_INFO_MAP
+from helper import Label, CollapsibleSection, SensorSelection, Count
+
+
+if "win32" in sys.platform.lower():
+    import ctypes
+    myappid = "acconeer.exploration.tool"
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+
+
+class GUI(QMainWindow):
+    DEFAULT_BAUDRATE = 3000000
+    ACC_IMG_FILENAME = os.path.join(os.path.dirname(__file__), "acc.png")
+    LAST_CONF_FILENAME = os.path.join(os.path.dirname(__file__), "last_config.npy")
+    MAX_CL_SWEEPS = 10000
+
+    ENVELOPE_PROFILES = [
+        (configs.EnvelopeServiceConfig.MAX_SNR, "Max SNR"),
+        (configs.EnvelopeServiceConfig.MAX_DEPTH_RESOLUTION, "Max depth resolution"),
+        (configs.EnvelopeServiceConfig.DIRECT_LEAKAGE, "Direct leakage"),
+    ]
+
+    sig_scan = pyqtSignal(str, str, object)
+    sig_pidget_event = pyqtSignal(object)
+
+    def __init__(self, under_test=False):
+        super().__init__()
+
+        self.under_test = under_test
+
+        self.cl_file = False
+        self.data = None
+        self.client = None
+        self.sweep_count = -1
+        self.sweep_buffer = 500
+        self.cl_supported = False
+        self.sweep_number = 0
+        self.sweeps_skipped = 0
+        self.service_labels = {}
+        self.service_params = None
+        self.service_defaults = None
+        self.advanced_process_data = {"use_data": False, "process_data": None}
+        self.creating_cl = False
+        self.baudrate = self.DEFAULT_BAUDRATE
+        self.session_info = None
+
+        self.gui_states = {
+            "has_loaded_data": False,
+            "server_connected": False,
+            "replaying_data": False,
+        }
+
+        self.current_data_type = None
+        self.current_module_label = None
+        self.canvas = None
+        self.multi_sensor_interface = True
+        self.control_grid_count = Count()
+        self.param_grid_count = Count(2)
+
+        self.sig_pidget_event.connect(self.pidget_processing_config_event_handler)
+
+        self.module_label_to_sensor_config_map = {}
+        self.module_label_to_processing_config_map = {}
+        self.current_module_info = MODULE_INFOS[0]
+        for idx, mi in enumerate(MODULE_INFOS):
+            if mi.sensor_config_class is not None:
+                self.module_label_to_sensor_config_map[mi.label] = mi.sensor_config_class()
+
+                processing_config = self.get_default_processing_config(mi.label)
+                self.module_label_to_processing_config_map[mi.label] = processing_config
+
+        self.setWindowIcon(QIcon(self.ACC_IMG_FILENAME))
+
+        self.init_pyqtgraph()
+        self.init_labels()
+        self.init_textboxes()
+        self.init_buttons()
+        self.init_dropdowns()
+        self.init_checkboxes()
+        self.init_sublayouts()
+        self.init_panel_scroll_area()
+        self.init_statusbar()
+        self.init_pidgets()
+
+        self.main_widget = QtWidgets.QSplitter(self.centralWidget())
+        self.main_widget.setStyleSheet("QSplitter::handle{background: lightgrey}")
+        self.setCentralWidget(self.main_widget)
+
+        self.canvas_widget = QFrame(self.main_widget)
+        self.canvas_widget.setFrameStyle(QFrame.Panel | QFrame.Sunken)
+        self.panel_scroll_area.setFrameStyle(QFrame.Panel | QFrame.Sunken)
+        self.main_widget.addWidget(self.panel_scroll_area)
+
+        self.canvas_layout = QtWidgets.QVBoxLayout(self.canvas_widget)
+
+        self.update_canvas(force_update=True)
+
+        self.resize(1200, 800)
+        self.setWindowTitle("Acconeer Exploration GUI")
+        self.show()
+        self.start_up()
+        self.version_check()
+
+        self.radar = data_processing.DataProcessing()
+
+    def init_pyqtgraph(self):
+        pg.setConfigOption("background", "#f0f0f0")
+        pg.setConfigOption("foreground", "k")
+        pg.setConfigOption("leftButtonPan", False)
+        pg.setConfigOptions(antialias=True)
+
+    def init_labels(self):
+        # key: text, group
+        label_info = {
+            "sensor": ("Sensor", "sensor"),
+            "gain": ("Gain", "sensor"),
+            "sweep_rate": ("Sweep frequency", "sensor"),
+            "sweeps": ("Number of sweeps", "sensor"),
+            "sweep_buffer": ("Sweep buffer", "scan"),
+            "range_start": ("Start (m)", "sensor"),
+            "range_end": ("Stop (m)", "sensor"),
+            "clutter": ("Background settings", "scan"),
+            "clutter_status": ("", "scan"),
+            "interface": ("Interface", "connection"),
+            "bin_count": ("Power bins", "sensor"),
+            "number_of_subsweeps": ("Subsweeps", "sensor"),
+            "sweep_info": ("", "statusbar"),
+            "saturated": ("Warning: Data saturated, reduce gain!", "statusbar"),
+            "stitching": ("Experimental stitching enabled!", "sensor"),
+            "empty_02": ("", "scan"),
+            "libver": ("", "statusbar"),
+        }
+
+        self.labels = {}
+        for key, (text, _) in label_info.items():
+            lbl = QLabel(self)
+            lbl.setText(text)
+            self.labels[key] = lbl
+
+        self.labels["bin_count"].setVisible(False)
+        self.labels["number_of_subsweeps"].setVisible(False)
+        self.labels["saturated"].setStyleSheet("color: #f0f0f0")
+        self.labels["stitching"].setVisible(False)
+        self.labels["stitching"].setStyleSheet("color: red")
+        self.labels["clutter_status"].setStyleSheet("color: red")
+        self.labels["clutter_status"].setVisible(False)
+        self.labels["empty_02"].hide()
+
+    def init_textboxes(self):
+        # key: text, group
+        textbox_info = {
+            "host": ("192.168.1.100", "connection"),
+            "sweep_rate": ("10", "sensor"),
+            "sweeps": ("-1", "sensor"),
+            "gain": ("0.4", "sensor"),
+            "range_start": ("0.18", "sensor"),
+            "range_end": ("0.72", "sensor"),
+            "sweep_buffer": ("100", "scan"),
+            "bin_count": ("-1", "sensor"),
+            "number_of_subsweeps": ("16", "sensor"),
+        }
+
+        self.textboxes = {}
+        for key, (text, _) in textbox_info.items():
+            self.textboxes[key] = QLineEdit(self)
+            self.textboxes[key].setText(text)
+            if key != "host":
+                self.textboxes[key].editingFinished.connect(self.check_values)
+
+        self.textboxes["bin_count"].setVisible(False)
+        self.textboxes["number_of_subsweeps"].setVisible(False)
+
+    def init_checkboxes(self):
+        # text, status, visible, enabled, function
+        checkbox_info = {
+            "clutter_file": ("", False, False, True, self.update_scan),
+            "verbose": ("Verbose logging", False, True, True, self.set_log_level),
+            "opengl": ("OpenGL", False, True, True, self.enable_opengl),
+        }
+
+        self.checkboxes = {}
+        for key, (text, status, visible, enabled, fun) in checkbox_info.items():
+            cb = QCheckBox(text, self)
+            cb.setChecked(status)
+            cb.setVisible(visible)
+            cb.setEnabled(enabled)
+            if fun:
+                cb.stateChanged.connect(fun)
+            self.checkboxes[key] = cb
+
+    def init_graphs(self, refresh=False):
+        processing_config = self.get_default_processing_config()
+
+        mode_is_sparse = (self.current_data_type == "sparse")
+        self.textboxes["number_of_subsweeps"].setVisible(mode_is_sparse)
+        self.labels["number_of_subsweeps"].setVisible(mode_is_sparse)
+        mode_is_power_bin = (self.current_data_type == "power_bin")
+        self.textboxes["bin_count"].setVisible(mode_is_power_bin)
+        self.labels["bin_count"].setVisible(mode_is_power_bin)
+        self.env_profiles_dd.setVisible(self.current_data_type == "envelope")
+
+        self.cl_supported = False
+        if self.current_module_label in ["IQ", "Envelope"]:
+            self.cl_supported = True
+
+        self.buttons["create_cl"].setVisible(self.cl_supported)
+        self.buttons["create_cl"].setEnabled(self.cl_supported)
+        self.buttons["load_cl"].setVisible(self.cl_supported)
+        self.buttons["load_cl"].setEnabled(self.cl_supported)
+        self.labels["clutter"].setVisible(self.cl_supported)
+
+        if self.current_module_info.module is None:
+            canvas = Label(self.ACC_IMG_FILENAME)
+            self.buttons["sensor_defaults"].setEnabled(False)
+            self.refresh_pidgets()
+            return canvas
+        else:
+            self.buttons["sensor_defaults"].setEnabled(True)
+
+        canvas = pg.GraphicsLayoutWidget()
+
+        if self.client:
+            self.client.squeeze = not self.current_module_info.multi_sensor
+
+        if not refresh:
+            self.set_multi_sensors()
+
+            if not (processing_config and isinstance(processing_config, dict)):
+                self.service_params = None
+                self.service_defaults = None
+            else:
+                self.service_params = processing_config
+                self.service_defaults = copy.deepcopy(self.service_params)
+
+            self.add_params(self.service_params)
+
+        if refresh:
+            self.save_gui_settings_to_sensor_config()
+        else:
+            self.load_gui_settings_from_sensor_config()
+
+        self.reload_pg_updater(canvas=canvas)
+
+        self.refresh_pidgets()
+
+        return canvas
+
+    def reload_pg_updater(self, canvas=None, session_info=None):
+        if canvas is None:
+            canvas = pg.GraphicsLayoutWidget()
+            self.swap_canvas(canvas)
+
+        sensor_config = self.get_sensor_config()
+        processing_config = self.update_service_params()
+
+        if session_info is None:
+            session_info = MockClient().setup_session(sensor_config)
+
+        self.service_widget = self.current_module_info.module.PGUpdater(
+            sensor_config, processing_config, session_info)
+
+        self.service_widget.setup(canvas)
+
+    def init_pidgets(self):
+        self.last_processing_config = None
+
+        for module_label, processing_config in self.module_label_to_processing_config_map.items():
+            if not isinstance(processing_config, configbase.Config):
+                continue
+
+            processing_config._event_handlers.add(self.pidget_processing_config_event_handler)
+            pidgets = processing_config._create_pidgets()
+
+            for pidget in pidgets:
+                if pidget is None:
+                    continue
+
+                loc = pidget.param.pidget_location
+                if loc == "advanced":
+                    grid = self.advanced_params_layout_grid
+                    count = self.param_grid_count
+                elif loc == "control":
+                    grid = self.control_section.grid
+                    count = self.control_grid_count
+                else:
+                    grid = self.serviceparams_sublayout_grid
+                    count = self.param_grid_count
+
+                grid.addWidget(pidget, count.val, 0, 1, 2)
+                count.post_incr()
+
+    def refresh_pidgets(self):
+        processing_config = self.get_processing_config()
+
+        if self.last_processing_config != processing_config:
+            if isinstance(self.last_processing_config, configbase.Config):
+                self.last_processing_config._state = configbase.Config.State.UNLOADED
+
+            self.last_processing_config = processing_config
+
+            # TODO: else return here when migration to configbase is done
+
+        if processing_config is None:
+            self.service_section.hide()
+            self.advanced_section.hide()
+            return
+
+        # TODO: remove the follow check when migration to configbase is done
+        if not isinstance(processing_config, configbase.Config):
+            return
+
+        processing_config._state = configbase.Config.State.LOADED
+
+        has_standard_params = has_advanced_params = False
+        for param in processing_config._get_params():
+            if param.pidget_class is not None:
+                loc = param.pidget_location
+                if loc == "advanced":
+                    has_advanced_params = True
+                elif loc == "control":
+                    pass
+                else:
+                    has_standard_params = True
+
+        self.service_section.setVisible(has_standard_params)
+        self.advanced_section.setVisible(has_advanced_params)
+
+    def pidget_processing_config_event_handler(self, processing_config):
+        if threading.current_thread().name != "MainThread":
+            self.sig_pidget_event.emit(processing_config)
+            return
+
+        # Processor
+        try:
+            if isinstance(self.radar.external, self.current_module_info.processor):
+                self.radar.external.update_processing_config(processing_config)
+        except AttributeError:
+            pass
+
+        # Plot updater
+        try:
+            self.service_widget.update_processing_config(processing_config)
+        except AttributeError:
+            pass
+
+        processing_config._update_pidgets()
+
+    def init_dropdowns(self):
+        self.module_dd = QComboBox(self)
+
+        for module_info in MODULE_INFOS:
+            self.module_dd.addItem(module_info.label)
+
+        self.module_dd.currentIndexChanged.connect(self.update_canvas)
+
+        self.interface_dd = QComboBox(self)
+        self.interface_dd.addItem("Socket")
+        self.interface_dd.addItem("Serial")
+        self.interface_dd.addItem("SPI")
+        self.interface_dd.addItem("Simulated")
+        self.interface_dd.currentIndexChanged.connect(self.update_interface)
+
+        self.ports_dd = QComboBox(self)
+        self.ports_dd.hide()
+        self.update_ports()
+
+        self.env_profiles_dd = QComboBox(self)
+        for _, text in self.ENVELOPE_PROFILES:
+            self.env_profiles_dd.addItem(text)
+        self.env_profiles_dd.currentIndexChanged.connect(self.set_profile)
+
+    def enable_opengl(self):
+        if self.checkboxes["opengl"].isChecked():
+            warning = "Do you really want to enable OpenGL?"
+            detailed = "Enabling OpenGL might crash the GUI or introduce graphic glitches!"
+            if self.warning_message(warning, detailed_warning=detailed):
+                pg.setConfigOptions(useOpenGL=True)
+                self.update_canvas(force_update=True)
+            else:
+                self.checkboxes["opengl"].setChecked(False)
+        else:
+            pg.setConfigOptions(useOpenGL=False)
+            self.update_canvas(force_update=True)
+
+    def set_multi_sensors(self):
+        multi_sensor = False
+        if self.get_gui_state("has_loaded_data"):
+            multi_sensor = len(self.data[0]["sensor_config"].sensor) > 1
+        elif self.multi_sensor_interface:
+            multi_sensor = self.current_module_info.multi_sensor
+        self.sensor_selection.set_multi_sensor_support(multi_sensor)
+
+    def set_profile(self):
+        profile = self.env_profiles_dd.currentText().lower()
+
+        if "snr" in profile:
+            self.textboxes["gain"].setText(str(0.45))
+        elif "depth" in profile:
+            self.textboxes["gain"].setText(str(0.8))
+        elif "leakage" in profile:
+            self.textboxes["gain"].setText(str(0.2))
+            self.textboxes["range_start"].setText(str(0))
+            self.textboxes["range_end"].setText(str(0.3))
+
+    def update_ports(self):
+        port_infos = serial.tools.list_ports.comports()
+        ports = [port_info[0] for port_info in port_infos]
+
+        try:
+            opsys = os.uname()
+            if "microsoft" in opsys.release.lower() and "linux" in opsys.sysname.lower():
+                print("WSL detected. Limiting serial ports")
+                ports_reduced = []
+                for p in ports:
+                    if int(re.findall(r"\d+", p)[0]) < 20:
+                        ports_reduced.append(p)
+                ports = ports_reduced
+        except Exception:
+            pass
+
+        self.ports_dd.clear()
+        self.ports_dd.addItems(ports)
+
+    def advanced_port(self):
+        input_dialog = QtWidgets.QInputDialog(self)
+        input_dialog.setInputMode(QtWidgets.QInputDialog.IntInput)
+        input_dialog.setFixedSize(400, 200)
+        input_dialog.setCancelButtonText("Default")
+        input_dialog.setIntRange(0, 3e6)
+        input_dialog.setIntValue(self.baudrate)
+        input_dialog.setOption(QtWidgets.QInputDialog.UsePlainTextEditForTextInput)
+        input_dialog.setWindowTitle("Set baudrate")
+        input_dialog.setLabelText(
+                "Default is {}, only change if using special hardware"
+                .format(self.DEFAULT_BAUDRATE)
+                )
+
+        if input_dialog.exec_() == QtWidgets.QDialog.Accepted:
+            self.baudrate = int(input_dialog.intValue())
+        else:
+            self.baudrate = self.DEFAULT_BAUDRATE
+        input_dialog.deleteLater()
+
+    def init_buttons(self):
+        # key: text, function, enabled, hidden, group
+        button_info = {
+            "start": ("Start", self.start_scan, False, False, "scan"),
+            "connect": ("Connect", self.connect_to_server, True, False, "connection"),
+            "stop": ("Stop", self.stop_scan, False, False, "scan"),
+            "create_cl": (
+                "Scan Background",
+                lambda: self.start_scan(create_cl=True),
+                False,
+                False,
+                "scan",
+            ),
+            "load_cl": ("Load Background", self.load_clutter_file, False, False, "scan"),
+            "load_scan": ("Load Scan", lambda: self.load_scan(), True, False, "scan"),
+            "save_scan": ("Save Scan", lambda: self.save_scan(self.data), False, False, "scan"),
+            "replay_buffered": (
+                "Replay buffered/loaded",
+                lambda: self.load_scan(restart=True),
+                False,
+                False,
+                "scan",
+            ),
+            "scan_ports": ("Scan ports", self.update_ports, True, True, "connection"),
+            "sensor_defaults": (
+                "Defaults",
+                self.sensor_defaults_handler,
+                False,
+                False,
+                "sensor",
+            ),
+            "service_defaults": (
+                "Defaults",
+                self.service_defaults_handler,
+                True,
+                False,
+                "service",
+            ),
+            "advanced_defaults": (
+                "Defaults",
+                self.service_defaults_handler,
+                True,
+                False,
+                "advanced",
+            ),
+            "save_process_data": (
+                "Save process data",
+                lambda: self.handle_advanced_process_data("save"),
+                True,
+                True,
+                "advanced",
+            ),
+            "load_process_data": (
+                "Load process data",
+                lambda: self.handle_advanced_process_data("load"),
+                True,
+                True,
+                "advanced",
+            ),
+            "advanced_port": (
+                "Advanced port settings",
+                self.advanced_port,
+                True,
+                True,
+                "connection",
+            ),
+        }
+
+        self.buttons = {}
+        for key, (text, fun, enabled, hidden, _) in button_info.items():
+            btn = QPushButton(text, self)
+            btn.clicked.connect(fun)
+            btn.setEnabled(enabled)
+            btn.setHidden(hidden)
+            btn.setMinimumWidth(150)
+            self.buttons[key] = btn
+
+    def init_sublayouts(self):
+        self.panel_sublayout = QtWidgets.QVBoxLayout()
+        self.panel_sublayout.setContentsMargins(0, 3, 0, 3)
+        self.panel_sublayout.setSpacing(0)
+
+        server_section = CollapsibleSection("Connection", is_top=True)
+        self.panel_sublayout.addWidget(server_section)
+        server_section.grid.addWidget(self.labels["interface"], 0, 0)
+        server_section.grid.addWidget(self.interface_dd, 0, 1)
+        server_section.grid.addWidget(self.ports_dd, 1, 0)
+        server_section.grid.addWidget(self.textboxes["host"], 1, 0, 1, 2)
+        server_section.grid.addWidget(self.buttons["scan_ports"], 1, 1)
+        server_section.grid.addWidget(self.buttons["advanced_port"], 2, 0, 1, 2)
+        server_section.grid.addWidget(self.buttons["connect"], 3, 0, 1, 2)
+
+        self.control_section = CollapsibleSection("Scan controls")
+        self.panel_sublayout.addWidget(self.control_section)
+        c = self.control_grid_count
+        self.control_section.grid.addWidget(self.module_dd, c.pre_incr(), 0, 1, 2)
+        self.control_section.grid.addWidget(self.buttons["start"], c.pre_incr(), 0)
+        self.control_section.grid.addWidget(self.buttons["stop"], c.val, 1)
+        self.control_section.grid.addWidget(self.buttons["save_scan"], c.pre_incr(), 0)
+        self.control_section.grid.addWidget(self.buttons["load_scan"], c.val, 1)
+        self.control_section.grid.addWidget(self.buttons["replay_buffered"], c.pre_incr(), 0, 1, 2)
+        self.control_section.grid.addWidget(self.labels["sweep_buffer"], c.pre_incr(), 0)
+        self.control_section.grid.addWidget(self.textboxes["sweep_buffer"], c.val, 1)
+        self.control_section.grid.addWidget(self.labels["empty_02"], c.pre_incr(), 0)
+        self.control_section.grid.addWidget(self.labels["clutter_status"], c.pre_incr(), 0, 1, 2)
+        self.control_section.grid.addWidget(self.labels["clutter"], c.pre_incr(), 0)
+        self.control_section.grid.addWidget(self.buttons["create_cl"], c.pre_incr(), 0)
+        self.control_section.grid.addWidget(self.buttons["load_cl"], c.val, 1)
+        self.control_section.grid.addWidget(self.checkboxes["clutter_file"], c.pre_incr(), 0, 1, 2)
+
+        self.settings_section = CollapsibleSection("Sensor settings")
+        self.panel_sublayout.addWidget(self.settings_section)
+        c = Count()
+        self.settings_section.grid.addWidget(self.buttons["sensor_defaults"], c.val, 0, 1, 2)
+        self.settings_section.grid.addWidget(self.labels["sensor"], c.pre_incr(), 0)
+
+        self.sensor_selection = SensorSelection(error_handler=self.error_message)
+        self.settings_section.grid.addWidget(self.sensor_selection, c.val, 1)
+        self.set_multi_sensors()
+
+        self.settings_section.grid.addWidget(self.labels["range_start"], c.pre_incr(), 0)
+        self.settings_section.grid.addWidget(self.labels["range_end"], c.val, 1)
+        self.settings_section.grid.addWidget(self.textboxes["range_start"], c.pre_incr(), 0)
+        self.settings_section.grid.addWidget(self.textboxes["range_end"], c.val, 1)
+        self.settings_section.grid.addWidget(self.labels["sweep_rate"], c.pre_incr(), 0)
+        self.settings_section.grid.addWidget(self.textboxes["sweep_rate"], c.val, 1)
+        self.settings_section.grid.addWidget(self.labels["gain"], c.pre_incr(), 0)
+        self.settings_section.grid.addWidget(self.textboxes["gain"], c.val, 1)
+        self.settings_section.grid.addWidget(self.labels["sweeps"], c.pre_incr(), 0)
+        self.settings_section.grid.addWidget(self.textboxes["sweeps"], c.val, 1)
+        self.settings_section.grid.addWidget(self.labels["bin_count"], c.pre_incr(), 0)
+        self.settings_section.grid.addWidget(self.textboxes["bin_count"], c.val, 1)
+        self.settings_section.grid.addWidget(self.labels["number_of_subsweeps"], c.pre_incr(), 0)
+        self.settings_section.grid.addWidget(self.textboxes["number_of_subsweeps"], c.val, 1)
+        self.settings_section.grid.addWidget(self.env_profiles_dd, c.pre_incr(), 0, 1, 2)
+        self.settings_section.grid.addWidget(self.labels["stitching"], c.pre_incr(), 0, 1, 2)
+
+        self.service_section = CollapsibleSection("Processing settings")
+        self.panel_sublayout.addWidget(self.service_section)
+        self.service_section.grid.addWidget(self.buttons["service_defaults"], 0, 0, 1, 2)
+        self.serviceparams_sublayout_grid = self.service_section.grid
+
+        self.advanced_section = CollapsibleSection("Advanced settings", init_collapsed=True)
+        self.panel_sublayout.addWidget(self.advanced_section)
+        self.advanced_section.grid.addWidget(self.buttons["advanced_defaults"], 0, 0, 1, 2)
+        self.advanced_section.grid.addWidget(self.buttons["load_process_data"], 1, 0)
+        self.advanced_section.grid.addWidget(self.buttons["save_process_data"], 1, 1)
+        self.advanced_params_layout_grid = self.advanced_section.grid
+
+        self.panel_sublayout.addStretch()
+
+        self.service_section.hide()
+        self.advanced_section.hide()
+
+    def init_panel_scroll_area(self):
+        self.panel_scroll_area = QtWidgets.QScrollArea()
+        self.panel_scroll_area.setFrameShape(QFrame.NoFrame)
+        self.panel_scroll_area.setMinimumWidth(350)
+        self.panel_scroll_area.setMaximumWidth(600)
+        self.panel_scroll_area.setWidgetResizable(True)
+        self.panel_scroll_area.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOn)
+        self.panel_scroll_area.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.panel_scroll_area.horizontalScrollBar().setEnabled(False)
+        panel_scroll_area_widget = QWidget(self.panel_scroll_area)
+        self.panel_scroll_area.setWidget(panel_scroll_area_widget)
+        panel_scroll_area_widget.setLayout(self.panel_sublayout)
+
+    def init_statusbar(self):
+        self.statusBar().showMessage("Not connected")
+        self.labels["sweep_info"].setFixedWidth(220)
+        self.statusBar().addPermanentWidget(self.labels["saturated"])
+        self.statusBar().addPermanentWidget(self.labels["sweep_info"])
+        self.statusBar().addPermanentWidget(self.labels["libver"])
+        self.statusBar().addPermanentWidget(self.checkboxes["verbose"])
+        self.statusBar().addPermanentWidget(self.checkboxes["opengl"])
+        self.statusBar().setStyleSheet("QStatusBar{border-top: 1px solid lightgrey;}")
+        self.statusBar().show()
+
+    def add_params(self, params, start_up_mode=None):
+        if params is None:
+            params = {}
+
+        self.buttons["load_process_data"].hide()
+        self.buttons["save_process_data"].hide()
+        for mode in self.service_labels:
+            for param_key in self.service_labels[mode]:
+                for element in self.service_labels[mode][param_key]:
+                    if element in ["label", "box", "checkbox", "button"]:
+                        self.service_labels[mode][param_key][element].setVisible(False)
+
+        if start_up_mode is None:
+            mode = self.current_module_label
+            set_visible = True
+        else:
+            mode = start_up_mode
+            set_visible = False
+
+        if mode not in self.service_labels:
+            self.service_labels[mode] = {}
+
+        advanced_available = False
+        for param_key, param_dict in params.items():
+            if param_key not in self.service_labels[mode]:
+                param_gui_dict = {}
+                self.service_labels[mode][param_key] = param_gui_dict
+
+                advanced_available = bool(param_dict.get("advanced"))
+                if advanced_available:
+                    grid = self.advanced_params_layout_grid
+                else:
+                    grid = self.serviceparams_sublayout_grid
+
+                param_gui_dict["advanced"] = advanced_available
+
+                if "send_process_data" == param_key:
+                    data_buttons = param_gui_dict
+                    data_buttons["load_button"] = self.buttons["load_process_data"]
+                    data_buttons["save_button"] = self.buttons["save_process_data"]
+                    data_buttons["load_text"] = "Load " + param_dict["text"]
+                    data_buttons["save_text"] = "Save " + param_dict["text"]
+                    data_buttons["load_button"].setText(data_buttons["load_text"])
+                    data_buttons["save_button"].setText(data_buttons["save_text"])
+                    data_buttons["load_button"].setVisible(set_visible)
+                    data_buttons["save_button"].setVisible(set_visible)
+                elif isinstance(param_dict["value"], bool):
+                    param_gui_dict["checkbox"] = QCheckBox(param_dict["name"], self)
+                    param_gui_dict["checkbox"].setChecked(param_dict["value"])
+                    grid.addWidget(param_gui_dict["checkbox"], self.param_grid_count.val, 0, 1, 2)
+                elif param_dict["value"] is not None:
+                    param_gui_dict["label"] = QLabel(self)
+                    param_gui_dict["label"].setMinimumWidth(125)
+                    param_gui_dict["label"].setText(param_dict["name"])
+                    param_gui_dict["box"] = QLineEdit(self)
+                    param_gui_dict["box"].setText(str(param_dict["value"]))
+                    param_gui_dict["limits"] = param_dict["limits"]
+                    param_gui_dict["default"] = param_dict["value"]
+                    grid.addWidget(param_gui_dict["label"], self.param_grid_count.val, 0)
+                    grid.addWidget(param_gui_dict["box"], self.param_grid_count.val, 1)
+                    param_gui_dict["box"].setVisible(set_visible)
+                else:  # param is only a label
+                    param_gui_dict["label"] = QLabel(self)
+                    param_gui_dict["label"].setText(str(param_dict["text"]))
+                    grid.addWidget(param_gui_dict["label"], self.param_grid_count.val, 0, 1, 2)
+
+                self.param_grid_count.post_incr()
+            else:
+                param_gui_dict = self.service_labels[mode][param_key]
+
+                for element in param_gui_dict:
+                    if element in ["label", "box", "checkbox"]:
+                        param_gui_dict[element].setVisible(set_visible)
+                    if "button" in element:
+                        data_buttons = param_gui_dict
+                        data_buttons["load_button"].setText(data_buttons["load_text"])
+                        data_buttons["save_button"].setText(data_buttons["save_text"])
+                        data_buttons["load_button"].setVisible(set_visible)
+                        data_buttons["save_button"].setVisible(set_visible)
+                    if param_gui_dict["advanced"]:
+                        advanced_available = True
+
+        if start_up_mode is None:
+            self.service_section.setVisible(bool(params))
+
+            if advanced_available:
+                self.advanced_section.show()
+                self.advanced_section.button_event(override=True)
+            else:
+                self.advanced_section.hide()
+
+    def sensor_defaults_handler(self):
+        self.sweep_count = -1
+        self.textboxes["sweeps"].setText("-1")
+
+        sensor_config_class = self.current_module_info.sensor_config_class
+        default_config = None if sensor_config_class is None else sensor_config_class()
+
+        if default_config is None:
+            return
+
+        self.module_label_to_sensor_config_map[self.current_module_label] = default_config
+        self.load_gui_settings_from_sensor_config()
+
+    def service_defaults_handler(self):
+        processing_config = self.get_processing_config()
+
+        if isinstance(processing_config, configbase.Config):
+            processing_config._reset()
+            return
+
+        mode = self.current_module_label
+        if self.service_defaults is None:
+            return
+        for key in self.service_defaults:
+            if key in self.service_labels[mode]:
+                if "box" in self.service_labels[mode][key]:
+                    self.service_labels[mode][key]["box"].setText(
+                        str(self.service_defaults[key]["value"]))
+                if "checkbox" in self.service_labels[mode][key]:
+                    self.service_labels[mode][key]["checkbox"].setChecked(
+                        bool(self.service_defaults[key]["value"]))
+
+    def update_canvas(self, force_update=False):
+        module_label = self.module_dd.currentText()
+        switching_module = self.current_module_label != module_label
+        self.current_module_label = module_label
+
+        self.current_module_info = MODULE_LABEL_TO_MODULE_INFO_MAP[module_label]
+
+        if self.current_module_info.module is None:
+            data_type = None
+            self.external = None
+        else:
+            data_type = self.current_module_info.sensor_config_class().mode
+            self.external = self.current_module_info.processor
+
+        switching_data_type = self.current_data_type != data_type
+        self.current_data_type = data_type
+
+        if switching_data_type:
+            self.data = None
+            self.set_gui_state("has_loaded_data", False)
+            self.buttons["replay_buffered"].setEnabled(False)
+
+        if force_update or switching_module:
+            if not switching_module:
+                self.update_service_params()
+
+            new_canvas = self.init_graphs(refresh=(not switching_module))
+            self.swap_canvas(new_canvas)
+
+        self.load_gui_settings_from_sensor_config()
+
+    def swap_canvas(self, new_canvas):
+        if self.canvas is not None:
+            self.canvas_layout.removeWidget(self.canvas)
+            self.canvas.setParent(None)
+            self.canvas.deleteLater()
+
+        self.canvas_layout.addWidget(new_canvas)
+        self.canvas = new_canvas
+
+    def update_interface(self):
+        if self.gui_states["server_connected"]:
+            self.connect_to_server()
+
+        self.multi_sensor_interface = True
+        if "serial" in self.interface_dd.currentText().lower():
+            self.ports_dd.show()
+            self.textboxes["host"].hide()
+            self.buttons["advanced_port"].show()
+            self.buttons["scan_ports"].show()
+            self.update_ports()
+            self.multi_sensor_interface = False
+        elif "spi" in self.interface_dd.currentText().lower():
+            self.ports_dd.hide()
+            self.textboxes["host"].hide()
+            self.buttons["advanced_port"].hide()
+            self.buttons["scan_ports"].hide()
+            self.multi_sensor_interface = False
+        elif "socket" in self.interface_dd.currentText().lower():
+            self.ports_dd.hide()
+            self.textboxes["host"].show()
+            self.buttons["advanced_port"].hide()
+            self.buttons["scan_ports"].hide()
+        elif "simulated" in self.interface_dd.currentText().lower():
+            self.ports_dd.hide()
+            self.textboxes["host"].hide()
+            self.buttons["advanced_port"].hide()
+            self.buttons["scan_ports"].hide()
+
+        self.set_multi_sensors()
+
+    def error_message(self, error):
+        em = QtWidgets.QErrorMessage(self.main_widget)
+        em.setWindowTitle("Error")
+        em.showMessage(error)
+
+    def warning_message(self, warning, detailed_warning=None):
+        msg = QtWidgets.QMessageBox(self.main_widget)
+        msg.setIcon(QtWidgets.QMessageBox.Warning)
+        msg.setText(warning)
+        if detailed_warning:
+            msg.setDetailedText(detailed_warning)
+        msg.setWindowTitle("Warning")
+        msg.setStandardButtons(QtWidgets.QMessageBox.Ok | QtWidgets.QMessageBox.Cancel)
+        retval = msg.exec_()
+        return retval == 1024
+
+    def start_scan(self, create_cl=False, from_file=False):
+        if self.get_gui_state("has_loaded_data") and not from_file:
+            self.set_gui_state("has_loaded_data", False)
+        if self.current_module_info.module is None:
+            self.error_message("Please select a service or detector")
+            return
+
+        data_source = "stream"
+        if from_file:
+            try:
+                saved_sensor_config = copy.deepcopy(self.data[0]["sensor_config"])
+                self.load_gui_settings_from_sensor_config(saved_sensor_config)
+            except Exception:
+                print("Warning, could not restore config from cached data!")
+            data_source = "file"
+        self.sweep_buffer = 500
+
+        try:
+            self.sweep_buffer = int(self.textboxes["sweep_buffer"].text())
+        except Exception:
+            self.error_message("Sweep buffer needs to be a positive integer\n")
+            self.textboxes["sweep_buffer"].setText("500")
+
+        sensor_config = self.save_gui_settings_to_sensor_config()
+        if from_file:
+            # We need to fix sensors here, which are overwritten in above call
+            self.data[0]["sensor_config"] = saved_sensor_config
+
+        if create_cl and len(sensor_config.sensor) > 1:
+            self.error_message("Background is only supported for single sensor operation!\n")
+            return
+
+        if data_source == "file":
+            self.set_gui_state("replaying_data", True)
+
+        if create_cl:
+            self.sweep_buffer = min(self.sweep_buffer, self.MAX_CL_SWEEPS)
+            self.creating_cl = True
+            self.labels["empty_02"].hide()
+            self.labels["clutter_status"].show()
+            if self.cl_file:
+                self.load_clutter_file(force_unload=True)
+            self.input_clutter_sweeps()
+            if self.clutter_sweeps is None:
+                return
+        else:
+            self.creating_cl = False
+            self.clutter_sweeps = None
+
+        use_cl = False
+        if self.checkboxes["clutter_file"].isChecked():
+            use_cl = True
+
+        self.update_canvas(force_update=True)
+
+        processing_config = self.update_service_params()
+        mode = self.current_module_label
+        if mode == "Envelope" or mode == "IQ":
+            processing_config = copy.deepcopy(self.update_service_params())
+            processing_config["clutter_file"] = self.cl_file
+            processing_config["use_clutter"] = use_cl
+            processing_config["create_clutter"] = create_cl
+            if not create_cl:
+                processing_config["sweeps_requested"] = self.sweep_count
+            else:
+                processing_config["sweeps_requested"] = self.clutter_sweeps
+
+        params = {
+            "sensor_config": sensor_config,
+            "clutter_file": self.cl_file,
+            "use_clutter": use_cl,
+            "create_clutter": create_cl,
+            "data_source": data_source,
+            "service_type": self.current_module_label,
+            "sweep_buffer": self.sweep_buffer,
+            "service_params": processing_config,
+        }
+
+        self.threaded_scan = Threaded_Scan(params, parent=self)
+        self.threaded_scan.sig_scan.connect(self.thread_receive)
+        self.sig_scan.connect(self.threaded_scan.receive)
+
+        self.buttons["start"].setEnabled(False)
+        self.buttons["load_scan"].setEnabled(False)
+        self.buttons["save_scan"].setEnabled(False)
+        self.buttons["create_cl"].setEnabled(False)
+        self.buttons["load_cl"].setEnabled(False)
+        self.module_dd.setEnabled(False)
+        self.buttons["stop"].setEnabled(True)
+        self.checkboxes["opengl"].setEnabled(False)
+
+        self.sweep_number = 0
+        self.sweeps_skipped = 0
+        self.threaded_scan.start()
+
+        self.settings_section.body_widget.setEnabled(False)
+
+        if isinstance(processing_config, configbase.Config):
+            self.service_section.body_widget.setEnabled(True)
+            self.buttons["service_defaults"].setEnabled(False)
+            self.buttons["advanced_defaults"].setEnabled(False)
+            processing_config._state = configbase.Config.State.LIVE
+        else:
+            self.service_section.body_widget.setEnabled(False)
+
+        self.buttons["connect"].setEnabled(False)
+        self.buttons["replay_buffered"].setEnabled(False)
+
+    def set_gui_state(self, state, enabled):
+        if state in self.gui_states:
+            self.gui_states[state] = enabled
+        else:
+            print("{} is an unknown state!".format(state))
+            return
+
+        if state == "server_connected":
+            if enabled:
+                self.buttons["start"].setEnabled(True)
+                self.buttons["create_cl"].setEnabled(self.cl_supported)
+                self.buttons["load_cl"].setEnabled(self.cl_supported)
+                self.buttons["connect"].setText("Disconnect")
+                self.buttons["connect"].setStyleSheet("QPushButton {color: red}")
+                self.buttons["advanced_port"].setEnabled(False)
+                self.buttons["replay_buffered"].setEnabled(False)
+                self.gui_states["has_loaded_data"] = False
+                self.data = None
+                self.set_multi_sensors()
+            else:
+                self.buttons["connect"].setText("Connect")
+                self.buttons["connect"].setStyleSheet("QPushButton {color: black}")
+                self.buttons["start"].setEnabled(False)
+                self.buttons["create_cl"].setEnabled(False)
+                self.buttons["advanced_port"].setEnabled(True)
+                self.statusBar().showMessage("Not connected")
+                if self.cl_supported:
+                    self.buttons["load_cl"].setEnabled(True)
+
+        if state == "has_loaded_data":
+            if enabled:
+                if isinstance(self.data, list) and self.data[0].get("sensor_config"):
+                    self.set_multi_sensors()
+            else:
+                self.buttons["replay_buffered"].setEnabled(False)
+            self.init_graphs()
+
+    def get_gui_state(self, state):
+        if state in self.gui_states:
+            return self.gui_states[state]
+        else:
+            print("{} is an unknown state!".format(state))
+            return
+
+    def update_scan(self):
+        if self.cl_file:
+            clutter_file = self.cl_file
+            if not self.checkboxes["clutter_file"].isChecked():
+                clutter_file = None
+            self.sig_scan.emit("set_clutter_flag", "", clutter_file)
+
+    def stop_scan(self):
+        self.sig_scan.emit("stop", "", None)
+        self.buttons["load_scan"].setEnabled(True)
+        self.buttons["load_cl"].setEnabled(self.cl_supported)
+        self.buttons["create_cl"].setEnabled(self.cl_supported)
+        self.labels["empty_02"].show()
+        self.labels["clutter_status"].hide()
+        self.module_dd.setEnabled(True)
+        self.buttons["stop"].setEnabled(False)
+        self.buttons["connect"].setEnabled(True)
+        self.buttons["start"].setEnabled(True)
+        self.service_section.body_widget.setEnabled(True)
+        self.settings_section.body_widget.setEnabled(True)
+
+        processing_config = self.get_processing_config()
+        if isinstance(processing_config, configbase.Config):
+            self.buttons["service_defaults"].setEnabled(True)
+            self.buttons["advanced_defaults"].setEnabled(True)
+            processing_config._state = configbase.Config.State.LOADED
+
+        self.checkboxes["opengl"].setEnabled(True)
+        if self.data is not None:
+            self.buttons["replay_buffered"].setEnabled(True)
+            self.buttons["save_scan"].setEnabled(True)
+        self.set_gui_state("replaying_data", False)
+
+    def input_clutter_sweeps(self):
+        input_dialog = QtWidgets.QInputDialog(self)
+        input_dialog.setInputMode(QtWidgets.QInputDialog.IntInput)
+        input_dialog.setFixedSize(400, 200)
+        input_dialog.setIntRange(0, 3e6)
+        input_dialog.setIntValue(100)
+        input_dialog.setOption(QtWidgets.QInputDialog.UsePlainTextEditForTextInput)
+        input_dialog.setWindowTitle("Sweep count")
+        input_dialog.setLabelText(
+                "Over how many sweeps do you want to estimate the background?"
+                )
+
+        if input_dialog.exec_() == QtWidgets.QDialog.Accepted:
+            self.clutter_sweeps = int(input_dialog.intValue())
+        else:
+            self.clutter_sweeps = None
+        input_dialog.deleteLater()
+
+    def set_log_level(self):
+        log_level = logging.INFO
+        if self.checkboxes["verbose"].isChecked():
+            log_level = logging.DEBUG
+        example_utils.set_loglevel(log_level)
+
+    def connect_to_server(self):
+        if not self.get_gui_state("server_connected"):
+            max_num = 4
+            if self.current_module_info.module is None:
+                self.module_dd.setCurrentIndex(2)
+
+            if self.interface_dd.currentText().lower() == "socket":
+                host = self.textboxes["host"].text()
+                self.client = SocketClient(host)
+                statusbar_connection_info = "socket ({})".format(host)
+            elif self.interface_dd.currentText().lower() == "spi":
+                self.client = SPIClient()
+                statusbar_connection_info = "SPI"
+                max_num = 1
+            elif self.interface_dd.currentText().lower() == "simulated":
+                self.client = MockClient()
+                statusbar_connection_info = "simulated interface"
+            else:
+                port = self.ports_dd.currentText()
+                if "scan" in port.lower():
+                    self.error_message("Please select port first!")
+                    return
+
+                if self.baudrate != self.DEFAULT_BAUDRATE:
+                    print("Warning: Using non-standard baudrate of {}!".format(self.baudrate))
+                self.client = UARTClient(port, conf_baudrate=self.baudrate)
+                max_num = 1
+                statusbar_connection_info = "UART ({})".format(port)
+
+            conf = self.get_sensor_config()
+            sensor = 1
+            sensors_available = []
+            connection_success = False
+            error = None
+            while sensor <= max_num:
+                conf.sensor = sensor
+                try:
+                    self.client.setup_session(conf)
+                    self.client.start_streaming()
+                    self.client.stop_streaming()
+                    connection_success = True
+                    sensors_available.append(sensor)
+                except Exception as e:
+                    print("Sensor {:d} not available".format(sensor))
+                    error = e
+                sensor += 1
+            if connection_success:
+                self.sensor_selection.set_sensors(sensors_available)
+                self.set_gui_state("server_connected", True)
+                self.statusBar().showMessage("Connected via {}".format(statusbar_connection_info))
+            else:
+                self.error_message("Could not connect to server!\n{}".format(error))
+                return
+        else:
+            self.set_gui_state("server_connected", False)
+            self.sig_scan.emit("stop", "", None)
+            try:
+                self.client.stop_streaming()
+            except Exception:
+                pass
+
+            try:
+                self.client.disconnect()
+            except Exception:
+                pass
+
+    def load_gui_settings_from_sensor_config(self, config=None):
+        if config is None:
+            config = self.get_sensor_config()
+
+        if config is None:
+            return
+
+        # key: (default, format)
+        d = {
+            "range_start": (0.2, ".2f"),
+            "range_end": (0.8, ".2f"),
+            "gain": (0.5, ".2f"),
+            "sweep_rate": (30, ".0f"),
+            "number_of_subsweeps": (16, "d"),
+            "bin_count": (-1, "d"),
+        }
+
+        for key, (default, fmt) in d.items():
+            if not hasattr(config, key):
+                continue
+
+            val = getattr(config, key)
+            val = default if val is None else val
+            text = "{{:{}}}".format(fmt).format(val)
+            self.textboxes[key].setText(text)
+
+        self.sweep_count = -1
+
+        session_profile = getattr(config, "session_profile", None)
+        if session_profile is not None:
+            text = [text for v, text in self.ENVELOPE_PROFILES if v == session_profile][0]
+            index = self.env_profiles_dd.findText(text, QtCore.Qt.MatchFixedString)
+            self.env_profiles_dd.setCurrentIndex(index)
+
+        self.check_values()
+
+    def save_gui_settings_to_sensor_config(self):
+        config = self.get_sensor_config()
+
+        if config is None:
+            return None
+
+        stitching = self.check_values()
+        config.experimental_stitching = stitching
+        config.range_interval = [
+                float(self.textboxes["range_start"].text()),
+                float(self.textboxes["range_end"].text()),
+        ]
+        config.sweep_rate = int(self.textboxes["sweep_rate"].text())
+        config.gain = float(self.textboxes["gain"].text())
+        self.sweep_count = int(self.textboxes["sweeps"].text())
+        if self.current_data_type == "power_bin":
+            bin_count = int(self.textboxes["bin_count"].text())
+            if bin_count > 0:
+                config.bin_count = bin_count
+        if self.current_data_type == "sparse":
+            config.number_of_subsweeps = int(self.textboxes["number_of_subsweeps"].text())
+        if self.current_data_type == "envelope":
+            profile_text = self.env_profiles_dd.currentText()
+            profile_val = [v for v, text in self.ENVELOPE_PROFILES if text == profile_text][0]
+            config.session_profile = profile_val
+
+        return config
+
+    def update_service_params(self):
+        if isinstance(self.get_processing_config(), configbase.Config):
+            return self.get_processing_config()
+
+        errors = []
+        mode = self.current_module_label
+
+        if mode not in self.service_labels:
+            return None
+
+        for key in self.service_labels[mode]:
+            entry = self.service_labels[mode][key]
+            if "box" in entry:
+                er = False
+                val = self.is_float(entry["box"].text(),
+                                    is_positive=False)
+                limits = entry["limits"]
+                default = entry["default"]
+                if val is not False:
+                    val, er = self.check_limit(val, entry["box"],
+                                               limits[0], limits[1], set_to=default)
+                else:
+                    er = True
+                    val = default
+                    entry["box"].setText(str(default))
+                if er:
+                    errors.append("{:s} must be between {:s} and {:s}!\n".format(
+                        key, str(limits[0]), str(limits[1])))
+                self.service_params[key]["value"] = self.service_params[key]["type"](val)
+            elif "checkbox" in entry:
+                self.service_params[key]["value"] = entry["checkbox"].isChecked()
+
+            if "send_process_data" in key:
+                if self.advanced_process_data["use_data"]:
+                    if self.advanced_process_data["process_data"] is not None:
+                        data = self.advanced_process_data["process_data"]
+                        self.service_params["send_process_data"]["value"] = data
+                    else:
+                        data = self.service_params["send_process_data"]["text"]
+                        print(data + " data not available")
+                else:
+                    self.service_params["send_process_data"]["value"] = None
+
+        if len(errors):
+            self.error_message("".join(errors))
+
+        return self.service_params
+
+    def check_values(self):
+        mode = self.current_data_type
+        if mode is None:
+            return
+
+        errors = []
+        sweep_rate = self.textboxes["sweep_rate"].text()
+        if not sweep_rate.isdigit():
+            errors.append("Frequency must be an integer and not less than 0!\n")
+            sweep_rate = 10
+            self.textboxes["sweep_rate"].setText(str(sweep_rate))
+
+        sweeps = self.is_float(self.textboxes["sweeps"].text(), is_positive=False)
+        if sweeps == -1:
+            pass
+        elif sweeps >= 1:
+            if not self.textboxes["sweeps"].text().isdigit():
+                errors.append("Sweeps must be a -1 or an int larger than 0!\n")
+                self.textboxes["sweeps"].setText("-1")
+        else:
+            errors.append("Sweeps must be -1 or an int larger than 0!\n")
+            self.textboxes["sweeps"].setText("-1")
+
+        if "sparse" in mode.lower():
+            e = False
+            if not self.textboxes["number_of_subsweeps"].text().isdigit():
+                self.textboxes["number_of_subsweeps"].setText("16")
+                e = True
+            else:
+                textbox = self.textboxes["number_of_subsweeps"]
+                subs = int(textbox.text())
+                subs, e = self.check_limit(subs, textbox, 1, 64, set_to=16)
+            if e:
+                errors.append("Number of Subsweeps must be an int and between 1 and 64 !\n")
+
+        gain = self.is_float(self.textboxes["gain"].text())
+        gain, e = self.check_limit(gain, self.textboxes["gain"], 0, 1, set_to=0.7)
+        if e:
+            errors.append("Gain must be between 0 and 1!\n")
+
+        min_start_range = 0 if "leakage" in self.env_profiles_dd.currentText().lower() else 0.06
+        start = self.is_float(self.textboxes["range_start"].text(), is_positive=False)
+        start, e = self.check_limit(start, self.textboxes["range_start"], min_start_range, 6.94)
+        if e:
+            errors.append("Start range must be between {}m and 6.94m!\n".format(min_start_range))
+
+        end = self.is_float(self.textboxes["range_end"].text())
+        end, e = self.check_limit(end, self.textboxes["range_end"], 0.12, 7.03)
+        if e:
+            errors.append("End range must be between 0.12m and 7.0m!\n")
+
+        r = end - start
+
+        env_max_range = 0.96
+        iq_max_range = 0.72
+        if self.current_data_type in ["iq", "envelope"]:
+            if self.interface_dd.currentText().lower() == "socket":
+                env_max_range = 6.88
+                iq_max_range = 6.88
+            else:
+                env_max_range = 5.0
+                iq_max_range = 3.0
+
+        stitching = False
+        if r <= 0:
+            errors.append("Range must not be less than 0!\n")
+            self.textboxes["range_end"].setText(str(start + 0.06))
+            end = start + 0.06
+            r = end - start
+
+        if self.current_data_type == "envelope":
+            if r > env_max_range:
+                errors.append("Envelope range must be less than %.2fm!\n" % env_max_range)
+                self.textboxes["range_end"].setText(str(start + env_max_range))
+                end = start + env_max_range
+                r = end - start
+            elif r > 0.96:
+                stitching = True
+
+        if self.current_data_type == "iq":
+            if r > iq_max_range:
+                errors.append("IQ range must be less than %.2fm!\n" % iq_max_range)
+                self.textboxes["range_end"].setText(str(start + iq_max_range))
+                end = start + iq_max_range
+                r = end - start
+            elif r > 0.72:
+                stitching = True
+
+        self.labels["stitching"].setVisible(stitching)
+        self.textboxes["sweep_rate"].setEnabled(not stitching)
+
+        if len(errors):
+            self.error_message("".join(errors))
+
+        return stitching
+
+    def is_float(self, val, is_positive=True):
+        try:
+            f = float(val)
+            if is_positive and f <= 0:
+                raise ValueError("Not positive")
+            return f
+        except Exception:
+            return False
+
+    def check_limit(self, val, field, start, end, set_to=None):
+        out_of_range = False
+        try:
+            float(val)
+        except (ValueError, TypeError):
+            val = start
+            out_of_range = True
+        if val < start:
+            val = start
+            out_of_range = True
+        if val > end:
+            val = end
+            out_of_range = True
+        if out_of_range:
+            if set_to is not None:
+                val = set_to
+            field.setText(str(val))
+        return val, out_of_range
+
+    def load_clutter_file(self, force_unload=False, fname=None):
+        if not fname:
+            if "unload" in self.buttons["load_cl"].text().lower() or force_unload:
+                self.cl_file = None
+                self.checkboxes["clutter_file"].setVisible(False)
+                self.checkboxes["clutter_file"].setChecked(False)
+                self.buttons["load_cl"].setText("Load Background")
+                self.buttons["load_cl"].setStyleSheet("QPushButton {color: black}")
+            else:
+                options = QtWidgets.QFileDialog.Options()
+                options |= QtWidgets.QFileDialog.DontUseNativeDialog
+                fname, _ = QtWidgets.QFileDialog.getOpenFileName(
+                    self,
+                    "Load background file",
+                    "",
+                    "NumPy data Files (*.npy)",
+                    options=options
+                    )
+
+        if fname:
+            self.cl_file = fname
+            self.checkboxes["clutter_file"].setVisible(True)
+            s = "Background: {}".format(ntpath.basename(fname))
+            self.checkboxes["clutter_file"].setText(s)
+            self.checkboxes["clutter_file"].setChecked(True)
+            self.buttons["load_cl"].setText("Unload background")
+            self.buttons["load_cl"].setStyleSheet("QPushButton {color: red}")
+
+    def load_scan(self, restart=False):
+        if restart:
+            self.start_scan(from_file=True)
+            return
+
+        options = QtWidgets.QFileDialog.Options()
+        options |= QtWidgets.QFileDialog.DontUseNativeDialog
+        filename, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self,
+                "Load scan",
+                "",
+                "HDF5 data files (*.h5);; NumPy data files (*.npy)",
+                options=options
+                )
+
+        if filename:
+            cl_file = None
+            if filename.endswith(".h5"):
+                try:
+                    f = h5py.File(filename, "r")
+                except Exception as e:
+                    self.error_message("{}".format(e))
+                    print(e)
+                    return
+
+                try:
+                    real = np.asarray(list(f["real"]))
+                    im = np.asarray(list(f["imag"]))
+                except Exception as e:
+                    self.error_message("{}".format(e))
+                    return
+
+                try:
+                    module_label = f["service_type"][()]
+                except Exception:
+                    if np.any(np.nonzero(im.flatten())):
+                        module_label = "IQ"
+                    else:
+                        module_label = "Envelope"
+
+                    print("Service type not stored, autodetected {}".format(module_label))
+
+                index = self.module_dd.findText(module_label, QtCore.Qt.MatchFixedString)
+                if index >= 0:
+                    self.module_dd.setCurrentIndex(index)
+                    self.update_canvas()
+                else:
+                    self.error_message("Unknown module in loaded data")
+                    return
+
+                conf = copy.deepcopy(self.get_sensor_config())
+
+                try:
+                    if self.current_data_type == "iq":
+                        sweeps = real + 1j * im
+                    else:
+                        sweeps = real
+
+                    length = range(len(sweeps))
+                except Exception as e:
+                    self.error_message("{}".format(e))
+                    return
+
+                try:
+                    self.env_profiles_dd.setCurrentIndex(f["profile"][()])
+                except Exception:
+                    print("Could not restore envelope profile")
+
+                try:
+                    session_info = json.loads(f["session_info"][()])
+                except Exception:
+                    print("Could not restore session info")
+                    session_info = None
+
+                processing_config = self.get_processing_config()
+                if isinstance(processing_config, configbase.Config):
+                    try:
+                        s = f["processing_config_dump"][()]
+                        processing_config._loads(s)
+                    except Exception:
+                        print("Could not restore processing config")
+                else:
+                    try:
+                        module_label = self.current_module_label
+                        if self.service_params is not None:
+                            if module_label in self.service_labels:
+                                for key in self.service_labels[module_label]:
+                                    if "box" in self.service_labels[module_label][key]:
+                                        val = self.service_params[key]["type"](f[key][()])
+                                        if self.service_params[key]["type"] == np.float:
+                                            val = str("{:.4f}".format(val))
+                                        else:
+                                            val = str(val)
+                                        self.service_labels[module_label][key]["box"].setText(val)
+                    except Exception:
+                        print("Could not restore processing parameters")
+
+                try:
+                    conf.sweep_rate = f["sweep_rate"][()]
+                    conf.range_interval = [f["start"][()], f["end"][()]]
+                    if self.current_data_type == "power_bin":
+                        conf.bin_count = int(f["bin_count"][()])
+                    if self.current_data_type == "sparse":
+                        conf.number_of_subsweeps = int(f["number_of_subsweeps"][()])
+                except Exception as e:
+                    print("Config not stored in file: ", e)
+                    conf.range_interval = [
+                            float(self.textboxes["range_start"].text()),
+                            float(self.textboxes["range_end"].text()),
+                    ]
+                    conf.sweep_rate = int(self.textboxes["sweep_rate"].text())
+                try:
+                    conf.sensor = list(map(int, f["sensor"][()]))
+                except Exception as e:
+                    print("Sensor selection not stored: ", e)
+                    conf.sensor = 1
+                nr_sensors = len(conf.sensor)
+
+                cl_file = None
+                try:
+                    cl_file = f["clutter_file"][()]
+                except Exception:
+                    pass
+
+                has_sweep_info = True
+                nr = None
+                try:
+                    nr = np.asarray(list(f["sequence_number"]))
+                except Exception:
+                    has_sweep_info = False
+                    print("Session info not stored!")
+
+                try:
+                    sat = np.asarray(list(f["data_saturated"]))
+                except Exception:
+                    if nr is not None:
+                        sat = np.full(nr.shape, False)
+                    print("Saturaded info not stored!")
+
+                if nr is not None and nr_sensors == 1:
+                    sat = np.expand_dims(sat, axis=1)
+                    nr = np.expand_dims(nr, axis=1)
+
+                if has_sweep_info:
+                    self.data = [
+                        {
+                            "sweep_data": sweeps[i],
+                            "service_type": module_label,
+                            "sensor_config": conf,
+                            "cl_file": cl_file,
+                            "info": [
+                                {
+                                    "sequence_number": int(nr[i, s]),
+                                    "data_saturated": bool(sat[i, s]),
+                                } for s in range(nr_sensors)],
+                        } for i in length]
+                else:
+                    self.data = [
+                        {
+                            "sweep_data": sweeps[i],
+                            "service_type": module_label,
+                            "sensor_config": conf,
+                            "cl_file": cl_file,
+                        } for i in length]
+
+                self.data[0]["session_info"] = session_info
+            else:
+                try:
+                    data = np.load(filename, allow_pickle=True)
+                    module_label = data[0]["service_type"]
+                    cl_file = data[0]["cl_file"]
+                    conf = data[0]["sensor_config"]
+                except Exception as e:
+                    self.error_message("{}".format(e))
+                    return
+                index = self.module_dd.findText(module_label, QtCore.Qt.MatchFixedString)
+                if index >= 0:
+                    self.module_dd.setCurrentIndex(index)
+                    self.update_canvas()
+                self.data = data
+
+            self.set_gui_state("has_loaded_data", True)
+
+            self.sensor_selection.set_sensors(conf.sensor)
+            self.load_gui_settings_from_sensor_config(conf)
+
+            if isinstance(cl_file, str) or isinstance(cl_file, os.PathLike):
+                if len(cl_file):
+                    try:
+                        os.path.isfile(cl_file)
+                        self.load_clutter_file(fname=cl_file)
+                    except Exception as e:
+                        print("Background file not found")
+                        print(e)
+
+            print("Loaded file with {} sweeps.".format(len(self.data)))
+            self.start_scan(from_file=True)
+
+    def save_scan(self, data, clutter=False):
+        mode = self.current_module_label
+        if "sleep" in mode.lower():
+            if int(self.textboxes["sweep_buffer"].text()) < 1000:
+                self.error_message("Please set sweep buffer to >= 1000")
+                return
+        options = QtWidgets.QFileDialog.Options()
+        options |= QtWidgets.QFileDialog.DontUseNativeDialog
+
+        title = "Save scan"
+        file_types = "HDF5 data files (*.h5);; NumPy data files (*.npy)"
+        if clutter:
+            title = "Save background"
+            file_types = "NumPy data files (*.npy)"
+        filename, info = QtWidgets.QFileDialog.getSaveFileName(
+                self, title, "", file_types, options=options)
+
+        if filename:
+            if clutter:
+                try:
+                    np.save(filename, data)
+                except Exception as e:
+                    self.error_message("Failed to save file:\n {:s}".format(e))
+                    return
+                self.cl_file = filename
+                if "npy" not in filename.lower():
+                    self.cl_file += ".npy"
+                label_text = "Background: {}".format(ntpath.basename(filename))
+                self.checkboxes["clutter_file"].setText(label_text)
+                self.checkboxes["clutter_file"].setChecked(True)
+                self.checkboxes["clutter_file"].setVisible(True)
+                self.buttons["load_cl"].setText("Unload background")
+                self.buttons["load_cl"].setStyleSheet("QPushButton {color: red}")
+            else:
+                if "h5" in info:
+                    sweep_data = []
+                    info_available = True
+                    saturated_available = True
+
+                    # check for session info data
+                    try:
+                        nr_sensor = len(data[0]["sensor_config"].sensor)
+                        data[0]["info"][0]["sequence_number"]
+                    except Exception as e:
+                        print("Error saving session info: ", e)
+                        info_available = False
+
+                    # check for data saturated info
+                    try:
+                        data[0]["info"][0]["data_saturated"]
+                    except Exception as e:
+                        print("Error saving saturation data: ", e)
+                        saturated_available = False
+
+                    sequence_number = []
+                    data_saturated = []
+                    for i in range(nr_sensor):
+                        sequence_number.append([])
+                        data_saturated.append([])
+
+                    for sweep in data:
+                        sweep_data.append(sweep["sweep_data"])
+                        if info_available:
+                            for s in range(nr_sensor):
+                                if info_available:
+                                    session = sweep["info"][s]["sequence_number"]
+                                    sequence_number[s].append(session)
+                                if saturated_available:
+                                    saturated = sweep["info"][s]["data_saturated"]
+                                    data_saturated[s].append(saturated)
+
+                    sweep_data = np.asarray(sweep_data)
+                    if info_available:
+                        sequence_number = np.asarray(sequence_number).T
+                        if saturated_available:
+                            data_saturated = np.asarray(data_saturated).T
+                        else:
+                            data_saturated = np.full(sequence_number, False)
+
+                    try:
+                        sensor_config = data[0]["sensor_config"]
+                    except Exception as e:
+                        self.error_message("Cannot fetch sensor_config!\n {:s}".format(e))
+                        return
+
+                    if ".h5" not in filename:
+                        filename = filename + ".h5"
+                    try:
+                        f = h5py.File(filename, "w")
+                    except Exception as e:
+                        self.error_message("Failed to save file:\n {:s}".format(e))
+                        return
+
+                    cl_file = None
+                    if self.cl_file:
+                        cl_file = self.cl_file
+
+                    f.create_dataset("imag", data=np.imag(sweep_data), dtype=np.float32)
+                    f.create_dataset("real", data=np.real(sweep_data), dtype=np.float32)
+                    f.create_dataset("sweep_rate", data=int(self.textboxes["sweep_rate"].text()),
+                                     dtype=np.float32)
+                    f.create_dataset("start", data=float(sensor_config.range_start),
+                                     dtype=np.float32)
+                    f.create_dataset("end", data=float(sensor_config.range_end),
+                                     dtype=np.float32)
+                    f.create_dataset("gain", data=float(sensor_config.gain), dtype=np.float32)
+                    f.create_dataset("sensor", data=sensor_config.sensor, dtype=np.int)
+                    f.create_dataset("service_type", data=mode.lower(),
+                                     dtype=h5py.special_dtype(vlen=str))
+                    f.create_dataset("clutter_file", data=cl_file,
+                                     dtype=h5py.special_dtype(vlen=str))
+                    f.create_dataset("profile", data=self.env_profiles_dd.currentIndex(),
+                                     dtype=np.int)
+                    if info_available:
+                        f.create_dataset("sequence_number", data=sequence_number, dtype=np.int)
+                        f.create_dataset("data_saturated", data=data_saturated, dtype='u1')
+
+                    for key in ["bin_count", "number_of_subsweeps"]:
+                        val = getattr(sensor_config, key, None)
+                        if val is not None:
+                            f.create_dataset(key, data=int(val), dtype=np.int)
+
+                    f.create_dataset(
+                            "session_info",
+                            data=json.dumps(self.session_info),
+                            dtype=h5py.special_dtype(vlen=str),
+                            )
+
+                    processing_config = self.get_processing_config()
+                    if isinstance(processing_config, configbase.Config):
+                        s = processing_config._dumps()
+                        f.create_dataset(
+                                "processing_config_dump",
+                                data=s,
+                                dtype=h5py.special_dtype(vlen=str),
+                                )
+                    else:
+                        if mode in self.service_labels:
+                            for key in self.service_params:
+                                if key == "processing_handle":
+                                    continue
+
+                                f.create_dataset(key, data=self.service_params[key]["value"],
+                                                 dtype=np.float32)
+                else:
+                    try:
+                        if isinstance(processing_config, configbase.Config):
+                            s = processing_config._dumps()
+                            data[0]["processing_config_dump"] = s
+                        else:
+                            data[0]["service_params"] = self.service_params
+
+                        data[0]["session_info"] = self.session_info
+                    except Exception:
+                        pass
+                    try:
+                        np.save(filename, data)
+                    except Exception as e:
+                        self.error_message("Failed to save file:\n {:s}".format(e))
+                        return
+
+    def handle_advanced_process_data(self, action=None):
+        load_text = self.buttons["load_process_data"].text()
+        try:
+            data_text = self.service_params["send_process_data"]["text"]
+        except Exception as e:
+            print("Function not available! \n{}".format(e))
+            return
+
+        if action == "save":
+            if self.advanced_process_data["process_data"] is not None:
+                options = QtWidgets.QFileDialog.Options()
+                options |= QtWidgets.QFileDialog.DontUseNativeDialog
+
+                title = "Save " + load_text
+                file_types = "NumPy data files (*.npy)"
+                fname, info = QtWidgets.QFileDialog.getSaveFileName(
+                    self, title, "", file_types, options=options)
+                if fname:
+                    try:
+                        np.save(fname, self.advanced_process_data["process_data"])
+                    except Exception as e:
+                        self.error_message("Failed to save " + load_text + "{}".format(e))
+                        return
+                    self.advanced_process_data["use_data"] = True
+                    self.buttons["load_process_data"].setText(load_text.replace("Load", "Unload"))
+                    self.buttons["load_process_data"].setStyleSheet("QPushButton {color: red}")
+            else:
+                self.error_message(data_text + " data not availble!".format())
+        elif action == "load":
+            if "Unload" in load_text:
+                self.buttons["load_process_data"].setText(load_text.replace("Unload", "Load"))
+                self.buttons["load_process_data"].setStyleSheet("QPushButton {color: black}")
+                self.advanced_process_data["use_data"] = False
+            else:
+                options = QtWidgets.QFileDialog.Options()
+                options |= QtWidgets.QFileDialog.DontUseNativeDialog
+                fname, _ = QtWidgets.QFileDialog.getOpenFileName(
+                    self, "Load " + data_text, "", "NumPy data Files (*.npy)", options=options)
+                if fname:
+                    try:
+                        content = np.load(fname, allow_pickle=True)
+                        self.advanced_process_data["process_data"] = content
+                    except Exception as e:
+                        self.error_message("Failed to load " + data_text + "\n{}".format(e))
+                        return
+                    self.advanced_process_data["use_data"] = True
+                    self.buttons["load_process_data"].setText(load_text.replace("Load", "Unload"))
+                    self.buttons["load_process_data"].setStyleSheet("QPushButton {color: red}")
+        else:
+            print("Process data action not implemented")
+
+    def thread_receive(self, message_type, message, data=None):
+        if "error" in message_type:
+            self.error_message("{}".format(message))
+            if "client" in message_type:
+                self.stop_scan()
+                if self.get_gui_state("server_connected"):
+                    self.connect_to_server()
+                self.buttons["create_cl"].setEnabled(False)
+                self.buttons["start"].setEnabled(False)
+            if "clutter" in message_type:
+                self.load_clutter_file(force_unload=True)
+        elif message_type == "clutter_data":
+            self.save_scan(data, clutter=True)
+        elif message_type == "scan_data":
+            if not self.get_gui_state("replaying_data"):
+                self.data = data
+        elif message_type == "scan_done":
+            self.stop_scan()
+            if not self.get_gui_state("server_connected"):
+                self.buttons["start"].setEnabled(False)
+        elif "update_external_plots" in message_type:
+            if data is not None:
+                self.update_external_plots(data)
+        elif "sweep_info" in message_type:
+            self.update_sweep_info(data)
+        elif "session_info" in message_type:
+            if message == "mismatch":
+                self.update_ranges(data)
+            self.session_info = data
+            self.reload_pg_updater(session_info=data)
+        elif "process_data" in message_type:
+            self.advanced_process_data["process_data"] = data
+        elif "set_sensors" in message_type:
+            self.sensor_selection.set_sensors(data)
+        else:
+            print("Thread data not implemented!")
+            print(message_type, message, data)
+
+    def update_external_plots(self, data):
+        self.service_widget.update(data)
+
+    def update_sweep_info(self, data):
+        if isinstance(data, list):
+            self.sweeps_skipped += data[0]["sequence_number"] - (self.sweep_number + 1)
+            self.sweep_number = data[0]["sequence_number"]
+        else:
+            self.sweeps_skipped += data["sequence_number"] - (self.sweep_number + 1)
+            self.sweep_number = data["sequence_number"]
+
+        nr = ""
+        if self.sweep_number > 1e6:
+            self.sweep_number = 1e6
+            nr = ">"
+
+        skip = ""
+        if self.sweeps_skipped > 1e6:
+            self.sweeps_skipped = 1e6
+            skip = ">"
+
+        self.labels["sweep_info"].setText("Sweeps: {:s}{:d} (skipped {:s}{:d})".format(
+            nr, self.sweep_number, skip, self.sweeps_skipped))
+
+        saturated = False
+        if isinstance(data, list):
+            for i in range(len(data)):
+                if data[i].get("data_saturated"):
+                    saturated = True
+                    break
+        elif data.get("data_saturated"):
+            saturated = True
+
+        if saturated:
+            self.labels["saturated"].setStyleSheet("color: red")
+        else:
+            self.labels["saturated"].setStyleSheet("color: #f0f0f0")
+
+        if self.creating_cl:
+            sweeps = self.sweep_number - self.sweeps_skipped
+            clutter_status = "Scanning background sweep {:d} of {:d}".format(sweeps,
+                                                                             self.clutter_sweeps)
+            self.labels["clutter_status"].setText(clutter_status)
+
+    def update_ranges(self, data):
+        old_start = float(self.textboxes["range_start"].text())
+        old_end = float(self.textboxes["range_end"].text())
+        start = data["actual_range_start"]
+        self.textboxes["range_start"].setText("{:.2f}".format(start))
+        end = start + data["actual_range_length"]
+        self.textboxes["range_end"].setText("{:.2f}".format(end))
+        print("Updated range settings to match session info!")
+        print("Start {:.3f} -> {:.3f}".format(old_start, start))
+        print("End   {:.3f} -> {:.3f}".format(old_end, end))
+
+    def start_up(self):
+        if os.path.isfile(self.LAST_CONF_FILENAME) and not self.under_test:
+            try:
+                last = np.load(self.LAST_CONF_FILENAME, allow_pickle=True)
+                self.load_last_config(last.item())
+            except Exception as e:
+                print("Could not load settings from last session\n{}".format(e))
+
+    def load_last_config(self, last_config):
+        # Restore sensor configs
+        for key in self.module_label_to_sensor_config_map.keys():
+            if key in last_config["sensor_config_map"]:
+                self.module_label_to_sensor_config_map[key] = last_config["sensor_config_map"][key]
+
+        # Restore processing configs (configbase)
+        dumps = last_config.get("processing_config_dumps", {})
+        for key, conf in self.module_label_to_processing_config_map.items():
+            if key in dumps:
+                dump = last_config["processing_config_dumps"][key]
+                try:
+                    conf._loads(dump)
+                except Exception:
+                    print("Could not load processing config for \'{}\'".format(key))
+                    conf._reset()
+
+        # Restore misc. settings
+        self.textboxes["sweep_buffer"].setText(last_config["sweep_buffer"])
+        self.interface_dd.setCurrentIndex(last_config["interface"])
+        self.ports_dd.setCurrentIndex(last_config["port"])
+        self.textboxes["host"].setText(last_config["host"])
+        self.sweep_count = last_config["sweep_count"]
+
+        if last_config.get("baudrate") is not None:
+            self.baudrate = last_config["baudrate"]
+
+        # Restore processing configs
+        if last_config["service_settings"]:
+            for module_label in last_config["service_settings"]:
+                processing_config = self.get_default_processing_config(module_label)
+
+                if isinstance(processing_config, configbase.Config):
+                    continue
+
+                self.add_params(processing_config, start_up_mode=module_label)
+
+                labels = last_config["service_settings"][module_label]
+                for key in labels:
+                    if "checkbox" in labels[key]:
+                        checked = labels[key]["checkbox"]
+                        self.service_labels[module_label][key]["checkbox"].setChecked(checked)
+                    elif "box" in labels[key]:
+                        text = str(labels[key]["box"])
+                        self.service_labels[module_label][key]["box"].setText(text)
+
+    def version_check(self):
+        fdir = os.path.dirname(os.path.realpath(__file__))
+        fn = os.path.join(fdir, "../lib/acconeer_utils/__init__.py")
+        if os.path.isfile(fn):
+            with open(fn, "r") as f:
+                lines = [line.strip() for line in f.readlines()]
+
+            for line in lines:
+                if line.startswith("__version__"):
+                    fs_lib_ver = line.split("=")[1].strip()[1:-1]
+                    break
+            else:
+                fs_lib_ver = None
+        else:
+            fs_lib_ver = None
+
+        used_lib_ver = getattr(acconeer_utils, "__version__", None)
+
+        rerun_text = " - you probably need to rerun setup.py (python setup.py install --user)"
+        if used_lib_ver:
+            sb_text = "Lib v{}".format(used_lib_ver)
+
+            if fs_lib_ver != used_lib_ver:
+                sb_text += " (mismatch)"
+                self.error_message("Lib version mismatch" + rerun_text)
+        else:
+            sb_text = "Lib version unknown"
+            self.error_message("Could not read installed lib version" + rerun_text)
+
+        self.labels["libver"].setText(sb_text)
+
+    def closeEvent(self, event=None):
+        service_params = {}
+        for mode in self.service_labels:
+            if service_params.get(mode) is None:
+                service_params[mode] = {}
+            for key in self.service_labels[mode]:
+                if service_params[mode].get(key) is None:
+                    service_params[mode][key] = {}
+                    if "checkbox" in self.service_labels[mode][key]:
+                        checked = self.service_labels[mode][key]["checkbox"].isChecked()
+                        service_params[mode][key]["checkbox"] = checked
+                    elif "box" in self.service_labels[mode][key]:
+                        val = self.service_labels[mode][key]["box"].text()
+                        service_params[mode][key]["box"] = val
+
+        processing_config_dumps = {}
+        for module_label, config in self.module_label_to_processing_config_map.items():
+            try:
+                processing_config_dumps[module_label] = config._dumps()
+            except AttributeError:
+                pass
+
+        last_config = {
+            "sensor_config_map": self.module_label_to_sensor_config_map,
+            "processing_config_dumps": processing_config_dumps,
+            "sweep_count": self.sweep_count,
+            "host": self.textboxes["host"].text(),
+            "sweep_buffer": self.textboxes["sweep_buffer"].text(),
+            "interface": self.interface_dd.currentIndex(),
+            "port": self.ports_dd.currentIndex(),
+            "service_settings": service_params,
+            "baudrate": self.baudrate,
+            }
+
+        if not self.under_test:
+            np.save(self.LAST_CONF_FILENAME, last_config, allow_pickle=True)
+
+        try:
+            self.client.disconnect()
+        except Exception:
+            pass
+        self.close()
+
+    def get_sensor_config(self):
+        module_info = self.current_module_info
+
+        if module_info.module is None:
+            return None
+
+        module_label = module_info.label
+        config = self.module_label_to_sensor_config_map[module_label]
+
+        if len(self.sensor_selection.get_sensors()):
+            config.sensor = self.sensor_selection.get_sensors()
+        else:
+            config.sensor = [1]
+            self.sensor_selection.set_sensors([1])
+
+        return config
+
+    def get_processing_config(self, module_label=None):
+        if module_label is None:
+            module_info = self.current_module_info
+        else:
+            module_info = MODULE_LABEL_TO_MODULE_INFO_MAP[module_label]
+
+        if module_info.module is None:
+            return None
+
+        module_label = module_info.label
+        return self.module_label_to_processing_config_map[module_label]
+
+    def get_default_processing_config(self, module_label=None):
+        if module_label is not None:
+            module_info = MODULE_LABEL_TO_MODULE_INFO_MAP[module_label]
+        else:
+            module_info = self.current_module_info
+
+        module = module_info.module
+
+        if module is None or not hasattr(module, "get_processing_config"):
+            return {}
+
+        return module.get_processing_config()
+
+
+class Threaded_Scan(QtCore.QThread):
+    sig_scan = pyqtSignal(str, str, object)
+
+    def __init__(self, params, parent=None):
+        QtCore.QThread.__init__(self, parent)
+
+        self.client = parent.client
+        self.radar = parent.radar
+        self.sensor_config = params["sensor_config"]
+        self.params = params
+        self.data = parent.data
+        self.parent = parent
+        self.running = True
+        self.sweep_count = parent.sweep_count
+        if self.sweep_count == -1:
+            self.sweep_count = np.inf
+
+        if isinstance(params["service_params"], dict):
+            if params["service_params"].get("create_clutter"):
+                self.sweep_count = params["service_params"]["sweeps_requested"]
+
+        self.finished.connect(self.stop_thread)
+
+    def stop_thread(self):
+        self.quit()
+
+    def run(self):
+        if self.params["data_source"] == "stream":
+            data = None
+
+            try:
+                session_info = self.client.setup_session(self.sensor_config)
+                check = self.check_session_info(session_info)
+                check_msg = "ok" if check else "mismatch"
+                self.emit("session_info", check_msg, session_info)
+                self.radar.prepare_processing(self, self.params, session_info)
+                self.client.start_streaming()
+            except Exception as e:
+                self.emit("client_error", "Failed to setup streaming!\n"
+                          "{}".format(self.format_error(e)))
+                self.running = False
+
+            try:
+                while self.running:
+                    info, sweep = self.client.get_next()
+                    self.emit("sweep_info", "", info)
+                    plot_data, data, sweep_number = self.radar.process(sweep, info)
+                    if sweep_number + 1 >= self.sweep_count:
+                        self.running = False
+            except Exception as e:
+                msg = "Failed to communicate with server!\n{}".format(self.format_error(e))
+                self.emit("client_error", msg)
+
+            try:
+                self.client.stop_streaming()
+            except Exception:
+                pass
+
+            if data is not None and len(data) > 0:
+                data[0]["session_info"] = session_info
+                self.emit("scan_data", "", data)
+        elif self.params["data_source"] == "file":
+            try:
+                session_info = self.data[0]["session_info"]
+                assert session_info is not None
+            except (IndexError, KeyError, AttributeError, AssertionError):
+                # TODO: infer session info
+                print("No session info")
+                session_info = None
+
+            self.radar.prepare_processing(self, self.params, session_info)
+            self.radar.process_saved_data(self.data, self)
+        else:
+            self.emit("error", "Unknown mode %s!" % self.mode)
+        self.emit("scan_done", "", "")
+
+    def receive(self, message_type, message, data=None):
+        if message_type == "stop" and self.running:
+            self.running = False
+            self.radar.abort_processing()
+            if self.params["create_clutter"]:
+                self.emit("error", "Background scan not finished. "
+                          "Wait for sweep buffer to fill to finish background scan")
+        elif message_type == "set_clutter_flag":
+            self.radar.set_clutter_flag(data)
+
+    def emit(self, message_type, message, data=None):
+        self.sig_scan.emit(message_type, message, data)
+
+    def format_error(self, e):
+        exc_type, exc_obj, exc_tb = sys.exc_info()
+        fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
+        err = "{}\n{}\n{}\n{}".format(exc_type, fname, exc_tb.tb_lineno, e)
+        return err
+
+    def check_session_info(self, data):
+        try:
+            start = self.sensor_config.range_start
+            length = self.sensor_config.range_length
+            start_ok = abs(start - data["actual_range_start"]) < 0.01
+            len_ok = abs(length - data["actual_range_length"]) < 0.01
+        except (AttributeError, KeyError, TypeError):
+            pass
+        else:
+            if not start_ok or not len_ok:
+                self.sensor_config.range_start = data["actual_range_start"]
+                self.sensor_config.range_length = data["actual_range_length"]
+                return False
+        return True
+
+
+def sigint_handler(gui):
+    event = threading.Event()
+    thread = threading.Thread(target=watchdog, args=(event,))
+    thread.start()
+    gui.closeEvent()
+    event.set()
+    thread.join()
+
+
+def watchdog(event):
+    flag = event.wait(1)
+    if not flag:
+        print("\nforcing exit...")
+        os._exit(1)
+
+
+if __name__ == "__main__":
+    example_utils.config_logging(level=logging.INFO)
+
+    app = QApplication(sys.argv)
+    ex = GUI()
+
+    signal.signal(signal.SIGINT, lambda *_: sigint_handler(ex))
+
+    # Makes sure the signal is caught
+    timer = QtCore.QTimer()
+    timer.timeout.connect(lambda: None)
+    timer.start(200)
+
+    sys.exit(app.exec_())
