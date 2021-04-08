@@ -45,10 +45,10 @@ def main():
     while not interrupt_handler.got_signal:
         info, sweep = client.get_next()
         plot_data = processor.process(sweep)
-        logger(plot_data)
         if plot_data is not None:
             try:
                 pg_process.put_data(plot_data)
+                logger(str(plot_data))
             except PGProccessDiedException:
                 break
     #передача от сырого потока в обработчик
@@ -133,8 +133,7 @@ class PhaseTrackingProcessor:
 
 
 
-            plot_data =
-            {
+            plot_data = {
                 "abs": self.lp_ampl,
                 "arg": np.angle(sweep),
                 "com": self.lp_com,

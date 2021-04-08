@@ -49,7 +49,7 @@ class ExampleArgumentParser(ArgumentParser):
             help="the sensor(s) to use (default: 1)",
         )
 
-         verbosity_group = self.add_mutually_exclusive_group(required=False)
+        verbosity_group = self.add_mutually_exclusive_group(required=False)
 
         verbosity_group.add_argument(
             "-v",
