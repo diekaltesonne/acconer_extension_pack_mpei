@@ -1,7 +1,7 @@
 # Python
 __pycache__/
 *.pyc
-venv/
+.venv/
 env/
 *.npy
 
@@ -24,3 +24,5 @@ docs/_build
 
 # Data
 *.h5
+# VS Code workspace
+*.code-workspace
