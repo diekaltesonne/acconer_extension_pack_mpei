@@ -242,7 +242,7 @@ def main():
         if plot_data is not None:
             try:
                 pg_process.put_data(plot_data)
-                logger(str(plot_data))
+                logger(str(plot_data["iq_val"]))
             except PGProccessDiedException:
                 break
     #передача от сырого потока в обработчик
